@@ -10,8 +10,8 @@
 // 3. Click Extensions -> Apps Script
 // 4. Delete any code in the editor
 // 5. Paste this ENTIRE script
-// 6. IMPORTANT: Set your secret token on line 36 below
-//    (use the same token you set in the app's Admin settings)
+// 6. IMPORTANT: Set your secret tokens on lines 37-38 below
+//    (use CUSTOMER_TOKEN in the customer app and ADMIN_TOKEN in your admin copy)
 // 7. Click the disk icon (Save), name it "Home Kitchen Script"
 // 8. Click Deploy -> New deployment
 // 9. Select type: "Web app"
@@ -33,18 +33,58 @@
 // That's it! Orders will now flow into your spreadsheet.
 // =====================================================
 
-// *** SET YOUR SECRET TOKEN HERE ***
-// Pick any word or phrase. Must match what you enter in the app.
-var SECRET_TOKEN = 'mango2026';
-// Example: var SECRET_TOKEN = 'mango2026';
+// *** SET YOUR SECRET TOKENS HERE ***
+// CUSTOMER_TOKEN: used in the customer-facing app (index.html)
+// ADMIN_TOKEN: used in the admin app (Manage/menu.html) — grants full access
+var CUSTOMER_TOKEN = 'customer2026';
+var ADMIN_TOKEN = 'admin2026';
 
 var DEFAULT_PIN = '1234';
+
+// ============ TOKEN HELPERS ============
+
+function isAdminToken(token) {
+  return token === ADMIN_TOKEN;
+}
+
+function isValidToken(token) {
+  return token === CUSTOMER_TOKEN || token === ADMIN_TOKEN;
+}
+
+// ============ FORMULA INJECTION PROTECTION ============
+
+function safeSheetText(value, maxLen) {
+  var s = String(value || '').substring(0, maxLen || 200);
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  return s;
+}
+
+function sanitizePhone(value) {
+  return String(value || '').replace(/\D/g, '').substring(0, 15);
+}
+
+// ============ RATE LIMITING ============
+
+function checkRateLimit(phone) {
+  var cache = CacheService.getScriptCache();
+  var key = 'attempts_' + phone.replace(/\D/g, '').slice(-10);
+  var attempts = parseInt(cache.get(key) || '0');
+  if (attempts >= 5) return false;
+  cache.put(key, String(attempts + 1), 900); // 15 min expiry
+  return true;
+}
+
+function clearRateLimit(phone) {
+  var cache = CacheService.getScriptCache();
+  var key = 'attempts_' + phone.replace(/\D/g, '').slice(-10);
+  cache.remove(key);
+}
 
 // ============ PHONE WHITELIST ============
 
 function getApprovedPhones(spreadsheet) {
   var custSheet = spreadsheet.getSheetByName('Customers');
-  if (!custSheet) return null; // No Customers sheet = allow all (whitelist disabled)
+  if (!custSheet) return []; // No Customers sheet = block all (whitelist fail-closed)
 
   var data = custSheet.getDataRange().getValues();
   if (data.length < 2) return []; // Only header row, no phones = block all
@@ -58,7 +98,7 @@ function getApprovedPhones(spreadsheet) {
       break;
     }
   }
-  if (phoneCol === -1) return null; // No "Phone" column found = allow all
+  if (phoneCol === -1) return []; // No "Phone" column found = block all (fail-closed)
 
   // Collect all phone numbers, normalized to digits only
   var phones = [];
@@ -74,7 +114,8 @@ function getApprovedPhones(spreadsheet) {
 }
 
 function isPhoneApproved(phone, approvedList) {
-  if (approvedList === null) return true; // Whitelist disabled
+  // Always check against the list (fail-closed)
+  if (!approvedList || approvedList.length === 0) return false;
   var digits = String(phone).replace(/\D/g, '');
   var last10 = digits.slice(-10);
   for (var i = 0; i < approvedList.length; i++) {
@@ -137,15 +178,15 @@ function verifyPin(spreadsheet, phone, suppliedPin) {
 
 // ============ GET HANDLER ============
 // action=menu  -> returns the current menu (public, token only)
-// action=orders -> returns orders for a phone (requires phone+pin)
-// (no action + phone param -> legacy orders request)
+// action=settings -> returns settings (public, token only)
+// (admin-orders moved to POST for security)
 
 function doGet(e) {
   try {
     var token = e.parameter.token || '';
     var action = e.parameter.action || '';
 
-    if (token !== SECRET_TOKEN) {
+    if (!isValidToken(token)) {
       return ContentService.createTextOutput(
         JSON.stringify({ status: 'error', message: 'Invalid token' })
       ).setMimeType(ContentService.MimeType.JSON);
@@ -163,61 +204,20 @@ function doGet(e) {
       return doGetSettings(sheet);
     }
 
-    // ---- FETCH ALL ORDERS (admin view) ----
+    // ---- FETCH ALL ORDERS (admin view) - ADMIN ONLY ----
     if (action === 'admin-orders') {
+      if (!isAdminToken(token)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Admin authorization required' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
       return doGetAdminOrders(sheet);
     }
 
-    // ---- VERIFY PHONE + PIN (pre-validation before order/pin-change) ----
-    if (action === 'verify') {
-      var vPhone = e.parameter.phone || '';
-      var vPin = e.parameter.pin || '';
-
-      if (!vPhone || vPhone.replace(/\D/g, '').length < 10) {
-        return ContentService.createTextOutput(
-          JSON.stringify({ status: 'error', message: 'Invalid phone number' })
-        ).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      // Check phone whitelist
-      var approvedPhones = getApprovedPhones(sheet);
-      if (!isPhoneApproved(vPhone, approvedPhones)) {
-        return ContentService.createTextOutput(
-          JSON.stringify({ status: 'error', message: 'Phone not registered. Please contact the vendor to register.' })
-        ).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      // Check PIN
-      var vPinResult = verifyPin(sheet, vPhone, vPin);
-      if (!vPinResult.valid) {
-        return ContentService.createTextOutput(
-          JSON.stringify({ status: 'error', message: 'Incorrect PIN. Please check your PIN and try again.' })
-        ).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      return ContentService.createTextOutput(
-        JSON.stringify({ status: 'success', message: 'Verified' })
-      ).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    // ---- FETCH ORDERS (default) ----
-    var phone = e.parameter.phone || '';
-    var pin = e.parameter.pin || '';
-
-    if (!phone || phone.length < 10) {
-      return ContentService.createTextOutput(
-        JSON.stringify({ status: 'error', message: 'Invalid phone number' })
-      ).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    var pinResult = verifyPin(sheet, phone, pin);
-    if (!pinResult.valid) {
-      return ContentService.createTextOutput(
-        JSON.stringify({ status: 'error', message: 'Incorrect PIN' })
-      ).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    return doGetOrders(sheet, phone);
+    // All other GET operations have been moved to POST for security
+    return ContentService.createTextOutput(
+      JSON.stringify({ status: 'error', message: 'Unknown action' })
+    ).setMimeType(ContentService.MimeType.JSON);
 
   } catch (error) {
     return ContentService.createTextOutput(
@@ -389,7 +389,7 @@ function saveSettingsToSheet(spreadsheet, settingsObj) {
   for (var i = 0; i < keys.length; i++) {
     var val = settingsObj[keys[i]];
     if (val !== undefined && val !== null) {
-      settingsSheet.appendRow([keys[i], String(val).substring(0, 200)]);
+      settingsSheet.appendRow([keys[i], safeSheetText(val, 200)]);
     }
   }
   return true;
@@ -437,16 +437,38 @@ function saveMenuToSheet(spreadsheet, menuItems) {
     var item = menuItems[i];
     menuSheet.appendRow([
       Number(item.id) || (i + 1),
-      String(item.name || '').substring(0, 100),
+      safeSheetText(item.name, 100),
       Number(item.price) || 0,
-      String(item.unit || 'plate').substring(0, 10),
+      safeSheetText(item.unit || 'plate', 10),
       Number(item.available) || 0,
-      String(item.category || 'Others').substring(0, 30),
-      String(item.imageUrl || '').substring(0, 500)
+      safeSheetText(item.category || 'Others', 30),
+      safeSheetText(item.imageUrl, 500)
     ]);
   }
 
   return true;
+}
+
+// ============ MENU PRICE LOOKUP HELPER ============
+
+function buildMenuLookup(spreadsheet) {
+  var menuSheet = spreadsheet.getSheetByName('Menu');
+  if (!menuSheet) return {};
+
+  var data = menuSheet.getDataRange().getValues();
+  var lookup = {};
+  for (var r = 1; r < data.length; r++) {
+    var id = Number(data[r][0]) || r;
+    lookup[id] = {
+      id: id,
+      name: String(data[r][1] || '').trim(),
+      price: Number(data[r][2]) || 0,
+      unit: String(data[r][3] || 'plate').trim(),
+      available: Number(data[r][4]) || 0,
+      category: String(data[r][5] || 'Others').trim()
+    };
+  }
+  return lookup;
 }
 
 // ============ MAIN HANDLER (POST) ============
@@ -456,13 +478,91 @@ function doPost(e) {
     var data = JSON.parse(e.postData.contents);
 
     // --- TOKEN CHECK ---
-    if (!data.token || data.token !== SECRET_TOKEN) {
+    if (!data.token || !isValidToken(data.token)) {
       return ContentService.createTextOutput(
         JSON.stringify({ status: 'error', message: 'Invalid token' })
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
     var sheet = SpreadsheetApp.getActiveSpreadsheet();
+
+    // ============ VERIFY PHONE + PIN (moved from GET to POST) ============
+    if (data.verify) {
+      var vPhone = String(data.verify.phone || '').trim();
+      var vPin = String(data.verify.pin || '').trim();
+
+      if (!vPhone || vPhone.replace(/\D/g, '').length < 10) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Invalid phone number' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Rate limit check
+      if (!checkRateLimit(vPhone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Check phone whitelist
+      var approvedPhones = getApprovedPhones(sheet);
+      if (!isPhoneApproved(vPhone, approvedPhones)) {
+        if (approvedPhones.length === 0) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: 'Customer whitelist not configured. Ask admin to set up Customers sheet.' })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Phone not registered. Please contact the vendor to register.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Check PIN
+      var vPinResult = verifyPin(sheet, vPhone, vPin);
+      if (!vPinResult.valid) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Incorrect PIN. Please check your PIN and try again.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Success - clear rate limit
+      clearRateLimit(vPhone);
+
+      return ContentService.createTextOutput(
+        JSON.stringify({ status: 'success', message: 'Verified' })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ============ FETCH ORDERS (moved from GET to POST) ============
+    if (data.fetchOrders) {
+      var foPhone = String(data.fetchOrders.phone || '').trim();
+      var foPin = String(data.fetchOrders.pin || '').trim();
+
+      if (!foPhone || foPhone.replace(/\D/g, '').length < 10) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Invalid phone number' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Rate limit check
+      if (!checkRateLimit(foPhone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      var foPinResult = verifyPin(sheet, foPhone, foPin);
+      if (!foPinResult.valid) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Incorrect PIN' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Success - clear rate limit
+      clearRateLimit(foPhone);
+
+      return doGetOrders(sheet, foPhone);
+    }
 
     // ============ PIN CHANGE REQUEST ============
     if (data.pinChange) {
@@ -482,6 +582,13 @@ function doPost(e) {
         ).setMimeType(ContentService.MimeType.JSON);
       }
 
+      // Rate limit check
+      if (!checkRateLimit(phone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
       var check = verifyPin(sheet, phone, oldPin);
       if (check.info.row === -1) {
         return ContentService.createTextOutput(
@@ -494,6 +601,9 @@ function doPost(e) {
         ).setMimeType(ContentService.MimeType.JSON);
       }
 
+      // Success - clear rate limit
+      clearRateLimit(phone);
+
       // Write new PIN
       check.info.sheet.getRange(check.info.row, check.info.pinCol).setValue(newPin);
 
@@ -502,8 +612,13 @@ function doPost(e) {
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // ============ SAVE MENU (admin pushes menu to sheet) ============
+    // ============ SAVE MENU (admin pushes menu to sheet) - ADMIN ONLY ============
     if (data.saveMenu) {
+      if (!isAdminToken(data.token)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Admin authorization required' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
       if (!data.saveMenu.items || !Array.isArray(data.saveMenu.items)) {
         return ContentService.createTextOutput(
           JSON.stringify({ status: 'error', message: 'Invalid menu data' })
@@ -522,8 +637,13 @@ function doPost(e) {
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // ============ SAVE SETTINGS (admin pushes settings to sheet) ============
+    // ============ SAVE SETTINGS (admin pushes settings to sheet) - ADMIN ONLY ============
     if (data.saveSettings) {
+      if (!isAdminToken(data.token)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Admin authorization required' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
       saveSettingsToSheet(sheet, data.saveSettings);
       return ContentService.createTextOutput(
         JSON.stringify({ status: 'success', message: 'Settings saved' })
@@ -541,8 +661,13 @@ function doPost(e) {
 
       // --- PHONE WHITELIST CHECK ---
       var approvedPhones = getApprovedPhones(sheet);
-      var customerPhone = data.orders[0] ? data.orders[0].customerPhone : '';
+      var customerPhone = data.orders[0] ? sanitizePhone(data.orders[0].customerPhone) : '';
       if (!isPhoneApproved(customerPhone, approvedPhones)) {
+        if (approvedPhones.length === 0) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: 'Customer whitelist not configured. Ask admin to set up Customers sheet.' })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
         return ContentService.createTextOutput(
           JSON.stringify({ status: 'error', message: 'Phone not registered. Please contact the vendor to register.' })
         ).setMimeType(ContentService.MimeType.JSON);
@@ -550,12 +675,99 @@ function doPost(e) {
 
       // --- PIN CHECK ---
       var suppliedPin = String(data.pin || '').trim();
+
+      // Rate limit check
+      if (!checkRateLimit(customerPhone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
       var pinResult = verifyPin(sheet, customerPhone, suppliedPin);
       if (!pinResult.valid) {
         return ContentService.createTextOutput(
           JSON.stringify({ status: 'error', message: 'Incorrect PIN. Please check your PIN and try again.' })
         ).setMimeType(ContentService.MimeType.JSON);
       }
+
+      // Success - clear rate limit
+      clearRateLimit(customerPhone);
+
+      // --- SERVER-SIDE PRICE RECALCULATION ---
+      var menuLookup = buildMenuLookup(sheet);
+      var recalculatedRows = [];
+      var orderTotal = 0;
+      var firstRow = data.orders[0];
+      var orderId = String(firstRow.orderId || '').substring(0, 20);
+      var dateStr = String(firstRow.date || '').substring(0, 20);
+      var timeStr = String(firstRow.time || '').substring(0, 10);
+      var custName = safeSheetText(firstRow.customerName, 100);
+      var custPhone = sanitizePhone(firstRow.customerPhone);
+
+      for (var oi = 0; oi < data.orders.length; oi++) {
+        var row = data.orders[oi];
+        var itemName = String(row.itemName || '').trim();
+        var quantity = Number(row.quantity) || 0;
+
+        // Find item in menu by name (since client sends itemName)
+        var menuItem = null;
+        for (var mid in menuLookup) {
+          if (menuLookup[mid].name === itemName) {
+            menuItem = menuLookup[mid];
+            break;
+          }
+        }
+
+        // Reject unknown items
+        if (!menuItem) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: 'Unknown menu item: ' + itemName })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // Reject invalid quantities
+        if (quantity <= 0) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: 'Invalid quantity for ' + itemName })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // Reject out-of-stock items
+        if (menuItem.available <= 0) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: itemName + ' is out of stock' })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // Reject quantities exceeding available stock
+        if (quantity > menuItem.available) {
+          return ContentService.createTextOutput(
+            JSON.stringify({ status: 'error', message: 'Only ' + menuItem.available + ' ' + menuItem.unit + ' of ' + itemName + ' available' })
+          ).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // Server-calculated price
+        var serverPrice = menuItem.price;
+        var serverAmount = Math.round(serverPrice * quantity * 100) / 100;
+        orderTotal += serverAmount;
+
+        recalculatedRows.push({
+          orderId: orderId,
+          date: dateStr,
+          time: timeStr,
+          customerName: custName,
+          customerPhone: custPhone,
+          itemName: safeSheetText(itemName, 100),
+          quantity: quantity,
+          unit: menuItem.unit,
+          pricePerUnit: serverPrice,
+          amount: serverAmount,
+          paymentStatus: 'unpaid'
+        });
+      }
+
+      // Round total
+      orderTotal = Math.round(orderTotal * 100) / 100;
 
       var ordersSheet = sheet.getSheetByName('Orders');
 
@@ -578,28 +790,42 @@ function doPost(e) {
         }
       }
 
-      // Add each item row (with basic sanitization)
-      data.orders.forEach(function(row) {
+      // Add each item row using server-recalculated values
+      for (var ri = 0; ri < recalculatedRows.length; ri++) {
+        var rrow = recalculatedRows[ri];
         ordersSheet.appendRow([
-          String(row.orderId || '').substring(0, 20),
-          String(row.date || '').substring(0, 20),
-          String(row.time || '').substring(0, 10),
-          String(row.customerName || '').substring(0, 100),
-          String(row.customerPhone || '').substring(0, 15),
-          String(row.itemName || '').substring(0, 100),
-          Number(row.quantity) || 0,
-          String(row.unit || '').substring(0, 10),
-          Number(row.pricePerUnit) || 0,
-          Number(row.amount) || 0,
-          Number(row.orderTotal) || 0,
-          String(row.paymentStatus || 'unpaid').substring(0, 10),
+          rrow.orderId,
+          rrow.date,
+          rrow.time,
+          rrow.customerName,
+          rrow.customerPhone,
+          rrow.itemName,
+          rrow.quantity,
+          rrow.unit,
+          rrow.pricePerUnit,
+          rrow.amount,
+          orderTotal,
+          rrow.paymentStatus,
           '',
           'no'
         ]);
-      });
+      }
 
       // Also update the Summary sheet
-      updateSummary(sheet, data.orders[0]);
+      updateSummary(sheet, {
+        orderId: orderId,
+        date: dateStr,
+        time: timeStr,
+        customerName: custName,
+        customerPhone: custPhone,
+        orderTotal: orderTotal,
+        paymentStatus: 'unpaid'
+      });
+
+      // Return the server-calculated total so the client can use it
+      return ContentService.createTextOutput(
+        JSON.stringify({ status: 'success', serverTotal: orderTotal })
+      ).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ============ PAYMENT CLAIM (customer says "I paid") ============
@@ -608,7 +834,14 @@ function doPost(e) {
       var claimOrderId = String(claim.orderId || '').substring(0, 20);
       var claimPhone = String(claim.phone || '').trim();
       var claimPin = String(claim.pin || '').trim();
-      var claimNote = String(claim.note || '').substring(0, 200);
+      var claimNote = safeSheetText(claim.note, 200);
+
+      // Rate limit check
+      if (!checkRateLimit(claimPhone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
 
       // Verify PIN
       var claimPinResult = verifyPin(sheet, claimPhone, claimPin);
@@ -617,6 +850,8 @@ function doPost(e) {
           JSON.stringify({ status: 'error', message: 'Incorrect PIN' })
         ).setMimeType(ContentService.MimeType.JSON);
       }
+
+      clearRateLimit(claimPhone);
 
       var ordersSheet = sheet.getSheetByName('Orders');
       if (ordersSheet) {
@@ -665,6 +900,13 @@ function doPost(e) {
       var cancelPhone = String(cancel.phone || '').trim();
       var cancelPin = String(cancel.pin || '').trim();
 
+      // Rate limit check
+      if (!checkRateLimit(cancelPhone)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 15 minutes.' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
+
       // Verify PIN
       var cancelPinResult = verifyPin(sheet, cancelPhone, cancelPin);
       if (!cancelPinResult.valid) {
@@ -672,6 +914,8 @@ function doPost(e) {
           JSON.stringify({ status: 'error', message: 'Incorrect PIN' })
         ).setMimeType(ContentService.MimeType.JSON);
       }
+
+      clearRateLimit(cancelPhone);
 
       var ordersSheet = sheet.getSheetByName('Orders');
       if (ordersSheet) {
@@ -712,8 +956,13 @@ function doPost(e) {
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // ============ NOTIFY UPDATE (admin marks orders as notified) ============
+    // ============ NOTIFY UPDATE (admin marks orders as notified) - ADMIN ONLY ============
     if (data.notifyUpdate) {
+      if (!isAdminToken(data.token)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Admin authorization required' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
       var notifyIds = data.notifyUpdate.orderIds;
       if (notifyIds && Array.isArray(notifyIds) && notifyIds.length > 0) {
         var ordersSheet = sheet.getSheetByName('Orders');
@@ -761,8 +1010,13 @@ function doPost(e) {
       }
     }
 
-    // Handle payment updates (admin)
+    // Handle payment updates (admin) - ADMIN ONLY
     if (data.paymentUpdate) {
+      if (!isAdminToken(data.token)) {
+        return ContentService.createTextOutput(
+          JSON.stringify({ status: 'error', message: 'Admin authorization required' })
+        ).setMimeType(ContentService.MimeType.JSON);
+      }
       var ordersSheet = sheet.getSheetByName('Orders');
       if (ordersSheet) {
         var dataRange = ordersSheet.getDataRange();
@@ -822,8 +1076,8 @@ function updateSummary(spreadsheet, orderInfo) {
   summarySheet.appendRow([
     String(orderInfo.orderId || '').substring(0, 20),
     (orderInfo.date || '') + ' ' + (orderInfo.time || ''),
-    String(orderInfo.customerName || '').substring(0, 100),
-    String(orderInfo.customerPhone || '').substring(0, 15),
+    safeSheetText(orderInfo.customerName, 100),
+    sanitizePhone(orderInfo.customerPhone),
     Number(orderInfo.orderTotal) || 0,
     String(orderInfo.paymentStatus || 'unpaid').substring(0, 10)
   ]);
@@ -831,8 +1085,8 @@ function updateSummary(spreadsheet, orderInfo) {
 
 // Test function - run this to verify the sheet is set up correctly
 function testSetup() {
-  if (SECRET_TOKEN === 'CHANGE_ME') {
-    Logger.log('WARNING: You need to change SECRET_TOKEN on line 36!');
+  if (CUSTOMER_TOKEN === 'CHANGE_ME' || ADMIN_TOKEN === 'CHANGE_ME') {
+    Logger.log('WARNING: You need to change CUSTOMER_TOKEN and ADMIN_TOKEN!');
     return;
   }
   var sheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -840,12 +1094,12 @@ function testSetup() {
   // Check Customers sheet
   var custSheet = sheet.getSheetByName('Customers');
   if (!custSheet) {
-    Logger.log('NOTE: No "Customers" sheet found. Phone whitelist is DISABLED -- all orders accepted.');
+    Logger.log('WARNING: No "Customers" sheet found. Phone whitelist is FAIL-CLOSED -- NO orders will be accepted.');
     Logger.log('To enable: create a sheet named "Customers" with "Phone" and "PIN" column headers.');
   } else {
     var phones = getApprovedPhones(sheet);
-    if (phones === null) {
-      Logger.log('NOTE: Customers sheet exists but no "Phone" column found. Whitelist DISABLED.');
+    if (phones.length === 0) {
+      Logger.log('WARNING: Customers sheet exists but no valid phone numbers found. NO orders will be accepted.');
     } else {
       Logger.log('Phone whitelist ACTIVE. ' + phones.length + ' approved numbers found.');
     }
@@ -876,5 +1130,5 @@ function testSetup() {
     testSheet.getRange(1, 1, 1, 14).setFontWeight('bold');
     testSheet.setFrozenRows(1);
   }
-  Logger.log('Setup complete! Token is set and Orders sheet is ready.');
+  Logger.log('Setup complete! Tokens are set and Orders sheet is ready.');
 }
